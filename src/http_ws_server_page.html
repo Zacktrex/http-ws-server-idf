@@ -1,0 +1,146 @@
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>ESP-RS WebSocket Guessing Game</title>
+<script>
+// Prevent offline page caching
+if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(function(registrations) {
+        for(let registration of registrations) {
+            registration.unregister();
+        }
+    });
+}
+// Force reload if page was loaded from cache
+window.addEventListener('pageshow', function(event) {
+    if (event.persisted) {
+        window.location.reload();
+    }
+});
+</script>
+<style type="text/css">
+body {
+	max-width: 50em;
+	margin: auto;
+	padding: 1em;
+	font: 1em/1.65 sans-serif;
+}
+input {
+    width: 100%;
+    height: 3em;
+    margin-bottom: 1em;
+}
+</style>
+</head>
+<body onload="loadWebSocket()">
+<form id="the-form" action="/post" accept-charset="utf-8">
+<label for="user-text">Make a guess:</label>
+<input type="text" id="user-text" name="user_text"><br>
+<input type="submit" id="user-submit" value="Submit" disabled>
+</form>
+<p id="server-resp">Connecting...</p>
+<div id="rssi-info" style="margin-top: 1em; padding: 0.5em; background-color: #f0f0f0; border-radius: 4px;">
+    <strong>Signal Info:</strong><br>
+    RSSI: <span id="rssi-value">--</span> dBm<br>
+    Distance: <span id="distance-value">--</span> meters
+</div>
+<script type="text/javascript">
+
+const submitButton = document.getElementById("user-submit");
+const theForm = document.getElementById("the-form");
+const userText = document.getElementById("user-text");
+const serverResp = document.getElementById("server-resp");
+
+let ws;
+
+function loadWebSocket() {
+    // First, test if server is reachable
+    const host = window.location.host;
+    console.log('Testing server connection to:', host);
+    serverResp.innerText = 'Connecting to server...';
+    
+    // Test HTTP connection first with health endpoint
+    fetch('/health')
+        .then(response => {
+            if (response.ok) {
+                return response.text();
+            } else {
+                throw new Error('Server returned error: ' + response.status);
+            }
+        })
+        .then(data => {
+            console.log('Server is reachable via HTTP. Response:', data);
+            connectWebSockets();
+        })
+        .catch(error => {
+            console.error('Cannot reach server:', error);
+            serverResp.innerHTML = 'Cannot connect to server.<br>Please check:<br>1. You are connected to ESP32 WiFi network<br>2. Server IP is correct (try http://192.168.71.1 or http://192.168.4.1)<br>3. Server is running<br>4. Try hard refresh (Ctrl+F5)';
+            submitButton.disabled = true;
+        });
+}
+
+function connectWebSockets() {
+    const host = window.location.host;
+    console.log('Connecting WebSockets to:', host);
+    
+    // Game WebSocket
+    ws = new WebSocket(`ws://${host}/ws/guess`);
+    ws.onopen = function(e) {
+        console.log('Game WebSocket connected');
+        submitButton.disabled = false;
+        serverResp.innerText = 'Connected! Enter your guess.';
+        updateRSSI(); // Initial RSSI update
+        setInterval(updateRSSI, 2000); // Update every 2 seconds
+    };
+    ws.onclose = function(e) {
+        console.log('Game WebSocket closed', e);
+        submitButton.disabled = true;
+        serverResp.innerText = 'Connection closed. Error code: ' + (e.code || 'unknown') + '. Please refresh the page.';
+    };
+    ws.onerror = function(e) {
+        console.error('Game WebSocket error', e);
+        submitButton.disabled = true;
+        serverResp.innerText = 'Connection error. Check console for details.';
+    };
+    ws.onmessage = function(e) {
+        console.log('Game message received:', e.data);
+        serverResp.innerText = e.data;
+    };
+}
+
+function updateRSSI() {
+    fetch('/rssi')
+        .then(response => response.json())
+        .then(data => {
+            const rssiElement = document.getElementById('rssi-value');
+            const distanceElement = document.getElementById('distance-value');
+            
+            if (data.rssi !== null) {
+                rssiElement.textContent = data.rssi;
+                distanceElement.textContent = data.distance.toFixed(2);
+            } else {
+                rssiElement.textContent = 'N/A';
+                distanceElement.textContent = 'N/A';
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching RSSI:', error);
+            document.getElementById('rssi-value').textContent = 'Error';
+            document.getElementById('distance-value').textContent = 'Error';
+        });
+}
+
+theForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    ws.send(userText.value);
+    userText.value = ''; // Clear input after sending
+});
+
+</script>
+</body>
+</html>
