@@ -6,7 +6,7 @@
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>ESP-RS WebSocket Guessing Game</title>
+<title>ESP-RS WebSocket Server</title>
 <script>
 // Prevent offline page caching
 if ('serviceWorker' in navigator) {
@@ -35,6 +35,25 @@ input {
     height: 3em;
     margin-bottom: 1em;
 }
+.section {
+    margin-top: 2em;
+    padding: 1em;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background-color: #fafafa;
+}
+.section h2 {
+    margin-top: 0;
+}
+textarea {
+    width: 100%;
+    min-height: 4em;
+    margin-bottom: 1em;
+    font-family: inherit;
+    font-size: 1em;
+    padding: 0.5em;
+    box-sizing: border-box;
+}
 </style>
 </head>
 <body onload="loadWebSocket()">
@@ -44,6 +63,17 @@ input {
 <input type="submit" id="user-submit" value="Submit" disabled>
 </form>
 <p id="server-resp">Connecting...</p>
+
+<div class="section">
+    <h2>OLED Display Message</h2>
+    <form id="display-form">
+        <label for="display-text">Enter message to display on OLED:</label>
+        <textarea id="display-text" name="display_text" placeholder="Type your message here..."></textarea>
+        <input type="submit" id="display-submit" value="Send to OLED" disabled>
+    </form>
+    <p id="display-resp" style="margin-top: 0.5em; color: #666;">Connecting to display WebSocket...</p>
+</div>
+
 <div id="rssi-info" style="margin-top: 1em; padding: 0.5em; background-color: #f0f0f0; border-radius: 4px;">
     <strong>Signal Info:</strong><br>
     RSSI: <span id="rssi-value">--</span> dBm<br>
@@ -56,7 +86,13 @@ const theForm = document.getElementById("the-form");
 const userText = document.getElementById("user-text");
 const serverResp = document.getElementById("server-resp");
 
+const displaySubmitButton = document.getElementById("display-submit");
+const displayForm = document.getElementById("display-form");
+const displayText = document.getElementById("display-text");
+const displayResp = document.getElementById("display-resp");
+
 let ws;
+let wsDisplay;
 
 function loadWebSocket() {
     // First, test if server is reachable
@@ -111,6 +147,36 @@ function connectWebSockets() {
         console.log('Game message received:', e.data);
         serverResp.innerText = e.data;
     };
+    
+    // OLED Display WebSocket
+    wsDisplay = new WebSocket(`ws://${host}/ws/display`);
+    wsDisplay.onopen = function(e) {
+        console.log('Display WebSocket connected');
+        displaySubmitButton.disabled = false;
+        displayResp.innerText = 'Connected! Enter a message to display on OLED.';
+        displayResp.style.color = '#006400';
+    };
+    wsDisplay.onclose = function(e) {
+        console.log('Display WebSocket closed', e);
+        displaySubmitButton.disabled = true;
+        displayResp.innerText = 'Connection closed. Please refresh the page.';
+        displayResp.style.color = '#666';
+    };
+    wsDisplay.onerror = function(e) {
+        console.error('Display WebSocket error', e);
+        displaySubmitButton.disabled = true;
+        displayResp.innerText = 'Connection error. OLED may not be available.';
+        displayResp.style.color = '#d00';
+    };
+    wsDisplay.onmessage = function(e) {
+        console.log('Display message received:', e.data);
+        displayResp.innerText = e.data;
+        if (e.data.includes('Error')) {
+            displayResp.style.color = '#d00';
+        } else {
+            displayResp.style.color = '#006400';
+        }
+    };
 }
 
 function updateRSSI() {
@@ -139,6 +205,23 @@ theForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     ws.send(userText.value);
     userText.value = ''; // Clear input after sending
+});
+
+displayForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = displayText.value.trim();
+    if (message && wsDisplay && wsDisplay.readyState === WebSocket.OPEN) {
+        wsDisplay.send(message);
+        displayText.value = ''; // Clear input after sending
+        displayResp.innerText = 'Sending...';
+        displayResp.style.color = '#666';
+    } else if (!message) {
+        displayResp.innerText = 'Please enter a message.';
+        displayResp.style.color = '#d00';
+    } else {
+        displayResp.innerText = 'Not connected. Please refresh the page.';
+        displayResp.style.color = '#d00';
+    }
 });
 
 </script>

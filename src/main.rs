@@ -4,20 +4,23 @@
 
 mod config;
 mod guessing_game;
-// mod oled;
+mod oled;
 mod rssi;
 mod server;
 mod utils;
 
 use core::cmp::Ordering;
 use embedded_svc::{http::Method, io::Write, ws::FrameType};
-use esp_idf_svc::sys::{EspError, ESP_ERR_INVALID_SIZE};
+use esp_idf_svc::{
+    hal::peripherals::Peripherals,
+    sys::{EspError, ESP_ERR_INVALID_SIZE},
+};
 use log::*;
-use std::{collections::BTreeMap, ffi::CStr, sync::Mutex};
+use std::{collections::BTreeMap, ffi::CStr, sync::{Arc, Mutex}};
 
-use crate::config::{INDEX_HTML, MAX_LEN};
+use crate::config::{INDEX_HTML, MAX_DISPLAY_LEN, MAX_LEN};
 use crate::guessing_game::GuessingGame;
-// use crate::oled::display_message;
+use crate::oled::OledDisplay;
 use crate::rssi::{calculate_distance_from_rssi, get_station_rssi};
 use crate::server::create_server;
 use crate::utils::{nth, rand};
@@ -29,7 +32,32 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting HTTP/WebSocket server...");
 
-    let mut server = create_server()?;
+    // Take peripherals
+    let peripherals = Peripherals::take()?;
+    
+    // Extract what we need for OLED and WiFi
+    let i2c = peripherals.i2c0;
+    let sda = peripherals.pins.gpio5;
+    let scl = peripherals.pins.gpio6;
+    let modem = peripherals.modem;
+    
+    // Initialize OLED display (uses I2C0, GPIO5, GPIO6)
+    let oled_display = match OledDisplay::init(i2c, sda, scl) {
+        Ok(display) => {
+            info!("OLED display initialized successfully");
+            if let Err(e) = display.display_welcome() {
+                warn!("Failed to display welcome message: {:?}", e);
+            }
+            Some(Arc::new(display))
+        }
+        Err(e) => {
+            warn!("Failed to initialize OLED display: {:?}", e);
+            warn!("Continuing without OLED display...");
+            None
+        }
+    };
+
+    let mut server = create_server(modem)?;
 
     server.fn_handler("/", Method::Get, |req| {
         info!("Serving index page to client from {}", req.uri());
@@ -101,6 +129,78 @@ fn main() -> anyhow::Result<()> {
         })?;
         Ok::<(), EspError>(())
     })?;
+
+    // WebSocket endpoint for displaying messages on OLED
+    if let Some(oled) = oled_display.clone() {
+        let oled_for_display = oled.clone();
+        server.ws_handler("/ws/display", move |ws| {
+            if ws.is_new() {
+                info!("New display WebSocket session {}", ws.session());
+                let _ = ws.send(FrameType::Text(false), b"Connected! Send a message to display on OLED.");
+                return Ok(());
+            } else if ws.is_closed() {
+                info!("Closed display WebSocket session {}", ws.session());
+                return Ok(());
+            }
+
+            // Receive message
+            let (_frame_type, len) = match ws.recv(&mut []) {
+                Ok(frame) => {
+                    let len = frame.1;
+                    debug!("Received display frame of length: {}", len);
+                    frame
+                }
+                Err(e) => {
+                    error!("Error receiving frame: {:?}", e);
+                    return Err(e);
+                }
+            };
+
+            if len > MAX_DISPLAY_LEN {
+                warn!("Message too big: {} bytes (max: {})", len, MAX_DISPLAY_LEN);
+                ws.send(FrameType::Text(false), "Message too big".as_bytes())?;
+                return Ok(());
+            }
+
+            let mut buf = [0; MAX_DISPLAY_LEN];
+            ws.recv(buf.as_mut())?;
+
+            // Try to parse as null-terminated C string first, otherwise use the length
+            let message = if let Ok(user_string) = CStr::from_bytes_until_nul(&buf[..len]) {
+                match user_string.to_str() {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!("Failed to decode UTF-8 string: {:?}", e);
+                        ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Not null-terminated, try to parse as UTF-8 directly
+                match std::str::from_utf8(&buf[..len]) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!("Failed to decode UTF-8 string: {:?}", e);
+                        ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                        return Ok(());
+                    }
+                }
+            };
+
+            info!("Received message to display: {}", message);
+
+            // Display on OLED
+            if let Err(e) = oled_for_display.display_message(message) {
+                error!("Failed to display message on OLED: {:?}", e);
+                ws.send(FrameType::Text(false), format!("Error displaying: {:?}", e).as_bytes())?;
+            } else {
+                ws.send(FrameType::Text(false), b"Message displayed on OLED!")?;
+            }
+
+            Ok::<(), EspError>(())
+        })?;
+        info!("WebSocket display endpoint registered at /ws/display");
+    }
 
     let guessing_games = Mutex::new(BTreeMap::<i32, GuessingGame>::new());
 

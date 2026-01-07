@@ -9,25 +9,18 @@ use esp_idf_svc::{
     nvs::EspDefaultNvsPartition,
     wifi::{BlockingWifi, EspWifi},
 };
-use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::modem::Modem;
 use log::*;
 
 /// Create and configure the HTTP server with WiFi access point
-/// Also initializes the OLED display if available
-pub fn create_server() -> Result<EspHttpServer<'static>> {
+pub fn create_server(modem: Modem) -> Result<EspHttpServer<'static>> {
     info!("Creating HTTP server...");
 
-    let peripherals = Peripherals::take()?;
-    
-    // Note: OLED initialization requires I2C and GPIO pins
-    // For now, we'll skip OLED init here since we need peripherals for WiFi
-    // OLED can be initialized separately if needed
-    // TODO: Restructure to allow sharing peripherals between WiFi and OLED
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
     let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        EspWifi::new(modem, sys_loop.clone(), Some(nvs))?,
         sys_loop,
     )?;
 
