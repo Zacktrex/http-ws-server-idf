@@ -4,20 +4,23 @@
 
 mod config;
 mod guessing_game;
-// mod oled;
+mod oled;
 mod rssi;
 mod server;
 mod utils;
 
 use core::cmp::Ordering;
 use embedded_svc::{http::Method, io::Write, ws::FrameType};
-use esp_idf_svc::sys::{EspError, ESP_ERR_INVALID_SIZE};
+use esp_idf_svc::{
+    hal::peripherals::Peripherals,
+    sys::{EspError, ESP_ERR_INVALID_SIZE},
+};
 use log::*;
-use std::{collections::BTreeMap, ffi::CStr, sync::Mutex};
+use std::{collections::BTreeMap, ffi::CStr, sync::{Arc, Mutex}};
 
-use crate::config::{INDEX_HTML, MAX_LEN};
+use crate::config::{INDEX_HTML, MAX_DISPLAY_LEN, MAX_LEN};
 use crate::guessing_game::GuessingGame;
-// use crate::oled::display_message;
+use crate::oled::OledDisplay;
 use crate::rssi::{calculate_distance_from_rssi, get_station_rssi};
 use crate::server::create_server;
 use crate::utils::{nth, rand};
@@ -29,7 +32,32 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting HTTP/WebSocket server...");
 
-    let mut server = create_server()?;
+    // Take peripherals
+    let peripherals = Peripherals::take()?;
+    
+    // Extract what we need for OLED and WiFi
+    let i2c = peripherals.i2c0;
+    let sda = peripherals.pins.gpio5;
+    let scl = peripherals.pins.gpio6;
+    let modem = peripherals.modem;
+    
+    // Initialize OLED display (uses I2C0, GPIO5, GPIO6)
+    let oled_display = match OledDisplay::init(i2c, sda, scl) {
+        Ok(display) => {
+            info!("OLED display initialized successfully");
+            if let Err(e) = display.display_welcome() {
+                warn!("Failed to display welcome message: {:?}", e);
+            }
+            Some(Arc::new(display))
+        }
+        Err(e) => {
+            warn!("Failed to initialize OLED display: {:?}", e);
+            warn!("Continuing without OLED display...");
+            None
+        }
+    };
+
+    let mut server = create_server(modem)?;
 
     server.fn_handler("/", Method::Get, |req| {
         info!("Serving index page to client from {}", req.uri());
@@ -102,36 +130,116 @@ fn main() -> anyhow::Result<()> {
         Ok::<(), EspError>(())
     })?;
 
+    // WebSocket endpoint for displaying messages on OLED
+    if let Some(oled) = oled_display.clone() {
+        let oled_for_display = oled.clone();
+        server.ws_handler("/ws/display", move |ws| {
+            if ws.is_new() {
+                info!("New display WebSocket session {}", ws.session());
+                let _ = ws.send(FrameType::Text(false), b"Connected! Send a message to display on OLED.");
+                return Ok(());
+            } else if ws.is_closed() {
+                info!("Closed display WebSocket session {}", ws.session());
+                return Ok(());
+            }
+
+            // Receive message
+            let (_frame_type, len) = match ws.recv(&mut []) {
+                Ok(frame) => {
+                    let len = frame.1;
+                    debug!("Received display frame of length: {}", len);
+                    frame
+                }
+                Err(e) => {
+                    error!("Error receiving frame: {:?}", e);
+                    return Err(e);
+                }
+            };
+
+            if len > MAX_DISPLAY_LEN {
+                warn!("Message too big: {} bytes (max: {})", len, MAX_DISPLAY_LEN);
+                ws.send(FrameType::Text(false), "Message too big".as_bytes())?;
+                return Ok(());
+            }
+
+            let mut buf = [0; MAX_DISPLAY_LEN];
+            ws.recv(buf.as_mut())?;
+
+            // Try to parse as null-terminated C string first, otherwise use the length
+            let message = if let Ok(user_string) = CStr::from_bytes_until_nul(&buf[..len]) {
+                match user_string.to_str() {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!("Failed to decode UTF-8 string: {:?}", e);
+                        ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Not null-terminated, try to parse as UTF-8 directly
+                match std::str::from_utf8(&buf[..len]) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!("Failed to decode UTF-8 string: {:?}", e);
+                        ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                        return Ok(());
+                    }
+                }
+            };
+
+            info!("Received message to display: {}", message);
+
+            // Display on OLED
+            if let Err(e) = oled_for_display.display_message(message) {
+                error!("Failed to display message on OLED: {:?}", e);
+                ws.send(FrameType::Text(false), format!("Error displaying: {:?}", e).as_bytes())?;
+            } else {
+                ws.send(FrameType::Text(false), b"Message displayed on OLED!")?;
+            }
+
+            Ok::<(), EspError>(())
+        })?;
+        info!("WebSocket display endpoint registered at /ws/display");
+    }
+
     let guessing_games = Mutex::new(BTreeMap::<i32, GuessingGame>::new());
 
     server.ws_handler("/ws/guess", move |ws| {
+        let session_id = ws.session();
         let mut sessions = guessing_games.lock().unwrap();
+        
         if ws.is_new() {
             let secret = (rand() % 100) + 1;
-            sessions.insert(ws.session(), GuessingGame::new(secret));
+            sessions.insert(session_id, GuessingGame::new(secret));
             info!(
-                "New WebSocket session {} ({} open)",
-                ws.session(),
+                "New WebSocket session {} ({} total sessions open)",
+                session_id,
                 sessions.len()
             );
 
             // Send welcome message
             let welcome_msg = "Welcome to the guessing game! Enter a number between 1 and 100".to_string();
-
+            drop(sessions); // Release lock before sending
             ws.send(FrameType::Text(false), welcome_msg.as_bytes())?;
             return Ok(());
         } else if ws.is_closed() {
-            sessions.remove(&ws.session());
-            info!(
-                "Closed WebSocket session {} ({} open)",
-                ws.session(),
-                sessions.len()
-            );
+            // Only remove this specific session - other sessions are unaffected
+            let removed = sessions.remove(&session_id);
+            if removed.is_some() {
+                info!(
+                    "Closed WebSocket session {} ({} total sessions remaining)",
+                    session_id,
+                    sessions.len()
+                );
+            } else {
+                warn!("Attempted to remove non-existent session {}", session_id);
+            }
             return Ok(());
         }
 
-        let session = sessions.get_mut(&ws.session()).unwrap();
-
+        // Release the lock before blocking on recv to allow other sessions to proceed
+        drop(sessions);
+        
         // NOTE: Due to the way the underlying C implementation works, ws.recv()
         // may only be called with an empty buffer exactly once to receive the
         // incoming buffer size, then must be called exactly once to receive the
@@ -139,11 +247,11 @@ fn main() -> anyhow::Result<()> {
         let (_frame_type, len) = match ws.recv(&mut []) {
             Ok(frame) => {
                 let len = frame.1;
-                debug!("Received frame of length: {}", len);
+                debug!("Received frame of length: {} from session {}", len, session_id);
                 frame
             }
             Err(e) => {
-                error!("Error receiving frame: {:?}", e);
+                error!("Error receiving frame from session {}: {:?}", session_id, e);
                 return Err(e);
             }
         };
@@ -158,20 +266,30 @@ fn main() -> anyhow::Result<()> {
         let mut buf = [0; MAX_LEN]; // Small digit buffer can go on the stack
         ws.recv(buf.as_mut())?;
 
-        let Ok(user_string) = CStr::from_bytes_until_nul(&buf[..len]) else {
-            warn!("Failed to decode C string from buffer");
-            ws.send(FrameType::Text(false), "[CStr decode Error]".as_bytes())?;
-            return Ok(());
-        };
-
-        let Ok(user_string) = user_string.to_str() else {
-            warn!("Failed to decode UTF-8 string");
-            ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
-            return Ok(());
+        // Try to parse as null-terminated C string first, otherwise use the length
+        let user_string = if let Ok(c_str) = CStr::from_bytes_until_nul(&buf[..len]) {
+            match c_str.to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to decode UTF-8 string from session {}: {:?}", session_id, e);
+                    ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                    return Ok(());
+                }
+            }
+        } else {
+            // Not null-terminated, try to parse as UTF-8 directly
+            match std::str::from_utf8(&buf[..len]) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to decode UTF-8 string from session {}: {:?}", session_id, e);
+                    ws.send(FrameType::Text(false), "[UTF-8 Error]".as_bytes())?;
+                    return Ok(());
+                }
+            }
         };
 
         let Some(user_guess) = GuessingGame::parse_guess(user_string) else {
-            info!("Invalid guess from client: {}", user_string);
+            info!("Invalid guess from session {}: {}", session_id, user_string);
             ws.send(
                 FrameType::Text(false),
                 "Please enter a number between 1 and 100".as_bytes(),
@@ -179,29 +297,51 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         };
 
+        // Process the guess and prepare reply - acquire lock only for this session
+        let (reply, new_secret) = {
+            let mut sessions = guessing_games.lock().unwrap();
+            let session = match sessions.get_mut(&session_id) {
+                Some(s) => s,
+                None => {
+                    warn!("Session {} not found, creating new one", session_id);
+                    let secret = (rand() % 100) + 1;
+                    sessions.insert(session_id, GuessingGame::new(secret));
+                    sessions.get_mut(&session_id).unwrap()
+                }
+            };
+            
             match session.guess(user_guess) {
-            (Ordering::Greater, n) => {
-                let reply = format!("Your {} guess was too high", nth(n));
-                info!("Sending reply: {}", reply);
-                ws.send(FrameType::Text(false), reply.as_ref())?;
+                (Ordering::Greater, n) => {
+                    let reply = format!("Your {} guess was too high", nth(n));
+                    (reply, None)
+                }
+                (Ordering::Less, n) => {
+                    let reply = format!("Your {} guess was too low", nth(n));
+                    (reply, None)
+                }
+                (Ordering::Equal, n) => {
+                    let secret_num = session.secret();
+                    let reply = format!(
+                        "You guessed {} on your {} try! Game over. Enter a new number to play again!",
+                        secret_num,
+                        nth(n)
+                    );
+                    // Generate a new secret for the next game
+                    let new_secret = (rand() % 100) + 1;
+                    sessions.insert(session_id, GuessingGame::new(new_secret));
+                    info!("Generated new secret {} for session {}", new_secret, session_id);
+                    (reply, Some(new_secret))
+                }
             }
-            (Ordering::Less, n) => {
-                let reply = format!("Your {} guess was too low", nth(n));
-                info!("Sending reply: {}", reply);
-                ws.send(FrameType::Text(false), reply.as_ref())?;
-            }
-            (Ordering::Equal, n) => {
-                let reply = format!(
-                    "You guessed {} on your {} try! Refresh to play again",
-                    session.secret(),
-                    nth(n)
-                );
-                info!("Game won! Sending reply: {}", reply);
-                ws.send(FrameType::Text(false), reply.as_ref())?;
-                ws.send(FrameType::Close, &[])?;
-            }
+        };
+        
+        if let Some(secret) = new_secret {
+            info!("Game won by session {}! New secret: {}", session_id, secret);
         }
-
+        
+        // Send reply (lock is already released)
+        ws.send(FrameType::Text(false), reply.as_ref())?;
+        
         Ok::<(), EspError>(())
     })?;
 

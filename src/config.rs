@@ -16,6 +16,8 @@ pub static INDEX_HTML: &str = include_str!("http_ws_server_page.html");
 
 // Max payload length for guessing game
 pub const MAX_LEN: usize = 8;
+// Max payload length for OLED display messages (longer to allow full messages)
+pub const MAX_DISPLAY_LEN: usize = 256;
 
 // Need lots of stack to parse JSON
 pub const STACK_SIZE: usize = 10240;

@@ -27,9 +27,10 @@ log = "0.4"
 anyhow = "1.0"
 embedded-svc = { version = "0.28", default-features = false }
 esp-idf-svc = { version = "0.51" }
+esp-idf-hal = "0.45"
 critical-section = { version = "1.1", features = ["std"], default-features = false }
-ssd1306 = { version = "0.8", default-features = false }
-embedded-hal = "0.2"
+ssd1306 = { version = "0.10", features = ["graphics"] }
+embedded-hal = "1"
 embedded-graphics = "0.8"
 
 # --- Optional Embassy Integration ---
