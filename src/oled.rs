@@ -32,6 +32,7 @@ pub struct OledDisplay {
 }
 
 enum DisplayType {
+    #[allow(dead_code)] // Available for future use with 128x64 displays
     Size128x64(Ssd1306<I2CInterface<&'static mut I2cDriver<'static>>, DisplaySize128x64, BufferedGraphicsMode<DisplaySize128x64>>),
     Size72x40(Ssd1306<I2CInterface<&'static mut I2cDriver<'static>>, DisplaySize72x40, BufferedGraphicsMode<DisplaySize72x40>>),
 }

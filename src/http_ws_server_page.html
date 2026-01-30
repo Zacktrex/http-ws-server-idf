@@ -93,6 +93,10 @@ const displayResp = document.getElementById("display-resp");
 
 let ws;
 let wsDisplay;
+let rssiInterval = null;
+// Unique connection ID for this tab (to prevent cross-tab interference)
+const connectionId = Math.random().toString(36).substring(7);
+console.log('Tab connection ID:', connectionId);
 
 function loadWebSocket() {
     // First, test if server is reachable
@@ -124,28 +128,84 @@ function connectWebSockets() {
     const host = window.location.host;
     console.log('Connecting WebSockets to:', host);
     
+    // Close any existing connections first
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+        console.log('Closing existing game WebSocket connection');
+        ws.close();
+    }
+    if (wsDisplay && wsDisplay.readyState !== WebSocket.CLOSED) {
+        console.log('Closing existing display WebSocket connection');
+        wsDisplay.close();
+    }
+    
     // Game WebSocket
     ws = new WebSocket(`ws://${host}/ws/guess`);
+    // Store connection ID on the WebSocket object for verification
+    ws._connectionId = connectionId;
+    
     ws.onopen = function(e) {
-        console.log('Game WebSocket connected');
-        submitButton.disabled = false;
-        serverResp.innerText = 'Connected! Enter your guess.';
-        updateRSSI(); // Initial RSSI update
-        setInterval(updateRSSI, 2000); // Update every 2 seconds
+        console.log(`[${connectionId}] Game WebSocket connected, readyState:`, this.readyState);
+        // Verify this is still our current WebSocket
+        if (ws && ws === this && ws._connectionId === connectionId) {
+            if (this.readyState === WebSocket.OPEN) {
+                submitButton.disabled = false;
+                serverResp.innerText = 'Connected! Enter your guess.';
+                updateRSSI(); // Initial RSSI update
+                // Clear any existing interval before setting a new one
+                if (rssiInterval) {
+                    clearInterval(rssiInterval);
+                }
+                rssiInterval = setInterval(updateRSSI, 2000); // Update every 2 seconds
+            } else {
+                console.warn(`[${connectionId}] WebSocket opened but readyState is not OPEN:`, this.readyState);
+                submitButton.disabled = true;
+                serverResp.innerText = 'Connection opened but not ready. Please refresh.';
+            }
+        } else {
+            console.warn(`[${connectionId}] Ignoring open event from stale WebSocket`);
+        }
     };
     ws.onclose = function(e) {
-        console.log('Game WebSocket closed', e);
-        submitButton.disabled = true;
-        serverResp.innerText = 'Connection closed. Error code: ' + (e.code || 'unknown') + '. Please refresh the page.';
+        console.log(`[${connectionId}] Game WebSocket closed. Code:`, e.code, 'Reason:', e.reason);
+        // Only disable button if this is our own connection closing
+        // Check if this is still the current WebSocket (not a stale reference)
+        if (ws && ws === this && ws._connectionId === connectionId) {
+            submitButton.disabled = true;
+            // Clear RSSI interval when connection closes
+            if (rssiInterval) {
+                clearInterval(rssiInterval);
+                rssiInterval = null;
+            }
+            // Only show error message if it wasn't a normal closure (code 1000)
+            if (e.code !== 1000 && e.code !== 1001) {
+                serverResp.innerText = 'Connection closed. Error code: ' + (e.code || 'unknown') + '. Please refresh the page.';
+            } else {
+                serverResp.innerText = 'Connection closed. Please refresh to reconnect.';
+            }
+        } else {
+            console.log(`[${connectionId}] Ignoring close event from stale WebSocket connection`);
+        }
     };
     ws.onerror = function(e) {
-        console.error('Game WebSocket error', e);
-        submitButton.disabled = true;
-        serverResp.innerText = 'Connection error. Check console for details.';
+        console.error(`[${connectionId}] Game WebSocket error for this tab only`, e);
+        // Only disable button if this is our own connection
+        if (ws && ws === this && ws._connectionId === connectionId) {
+            submitButton.disabled = true;
+            serverResp.innerText = 'Connection error. Check console for details.';
+        } else {
+            console.log(`[${connectionId}] Ignoring error from stale WebSocket`);
+        }
     };
     ws.onmessage = function(e) {
-        console.log('Game message received:', e.data);
-        serverResp.innerText = e.data;
+        console.log(`[${connectionId}] Game message received:`, e.data);
+        // Only process if this is our current WebSocket
+        if (ws && ws === this && ws._connectionId === connectionId && this.readyState === WebSocket.OPEN) {
+            serverResp.innerText = e.data;
+            // Ensure button stays enabled when receiving messages
+            submitButton.disabled = false;
+        } else {
+            console.log(`[${connectionId}] Ignoring message from stale WebSocket connection`);
+        }
     };
     
     // OLED Display WebSocket
@@ -203,8 +263,17 @@ function updateRSSI() {
 
 theForm.addEventListener("submit", async (e) => {
     e.preventDefault();
-    ws.send(userText.value);
-    userText.value = ''; // Clear input after sending
+    // Verify this is our current WebSocket connection
+    if (ws && ws._connectionId === connectionId && ws.readyState === WebSocket.OPEN) {
+        ws.send(userText.value);
+        userText.value = ''; // Clear input after sending
+    } else {
+        console.warn(`[${connectionId}] WebSocket not open or wrong connection, attempting to reconnect...`);
+        serverResp.innerText = 'Not connected. Please refresh the page.';
+        submitButton.disabled = true;
+        // Try to reconnect
+        connectWebSockets();
+    }
 });
 
 displayForm.addEventListener("submit", async (e) => {
